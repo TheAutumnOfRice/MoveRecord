@@ -1,16 +1,17 @@
 import json
 import os
 import pickle
-from typing import Callable, Any, Optional, Dict, Union, Tuple
 from copy import deepcopy
+from typing import Callable, Any, Optional, Dict, Union, Tuple
 
 MoveFun = Callable[[Dict], Any]
-AnyFun = Union[Callable[..., Any], str]
+AnyFun = Union[Callable[..., Any], str, None]
 ConFun = Union[Callable[[Dict], bool], str]
 IDType = Union[int, str]
 IDFun = Union[Callable[..., IDType], IDType]
-FunTuple = Tuple[AnyFun, IDType, Tuple, Dict, Dict, bool, bool]
-ErrTuple = Tuple[Any,bool]
+FunTuple = Tuple[AnyFun, IDType, Tuple, Dict, Dict, bool, bool, Any]
+ErrTuple = Tuple[Any, bool]
+
 
 class moveerr(Exception):
     """
@@ -39,6 +40,7 @@ class moveset:
         __current__ 当前执行（还没有执行完）的步骤
         __start__ moveset的入口ID
         __parent__ 上层moveset，该变量建议不修改，且会在save和load时主动跳过
+        __self__ 自己moveset实例，请勿使用
         __stack__ 用于捕获异常后，记录上一次current。该变量建议不修改。
     可以使用addvar添加一个变量（或者在运行中使用带有v后缀的wrap函数动态创建）
     """
@@ -70,19 +72,25 @@ class moveset:
         if type(fun) is str:
             funstr = fun
 
-            def str2fun(var: Dict = None):
+            def f(var: Dict = None):
                 try:
                     return eval(funstr)
                 except:
                     exec(funstr)
 
-            fun = str2fun
+            fun = f
+        elif fun is None:
+            def f(var: Dict = None):
+                pass
+
+            fun = f
         return fun
 
     def copy(self):
         """
         复制自身，对变量区深拷贝，moves浅拷贝
         如果var中含有__parent__，则跳过
+        跳过__self__
         """
         t = moveset(self.name, self.addr)
         t.moves = self.moves.copy()
@@ -90,9 +98,15 @@ class moveset:
         if "__parent__" in self.var:
             p = self.var["__parent__"]
             del self.var["__parent__"]
+        s = None
+        if "__self__" in self.var:
+            s = self.var["__self__"]
+            del self.var["__self__"]
         t.var = deepcopy(self.var)
         if p is not None:
             self.var["__parent__"] = p
+        if s is not None:
+            self.var["__self__"] = s
         t.varinit = deepcopy(self.varinit)
         t.parent = self.parent
         t.use_json = self.use_json
@@ -100,23 +114,25 @@ class moveset:
 
     def setstart(self, id: IDType):
         self.varinit["__start__"] = id
-    def seterr(self,code)->None:
+
+    def seterr(self, code) -> None:
         """
         如果该moveset运行时报错，且错误类型不为moveerr
         则该moveset向上报moveerr(code)错误
         设置为None时，向上传递原始错误
         :param code: 错误代码
         """
-        self.errcode=code
+        self.errcode = code
 
-    def addcatch(self,code,nextid:IDType,savecur=True) -> None:
+    def addcatch(self, code, nextid: IDType, savecur=True) -> None:
         """
         新增一个错误解决方案
         :param code: 捕获的moveerr的code
         :param nextid: 捕获到code后跳转的ID
         :param savecur: 是否存储当前位置（存储后，可以使用__last__跳转）
         """
-        self.catch[code]=(nextid,savecur)
+        self.catch[code] = (nextid, savecur)
+
     def addmove(self, id: IDType, fun: MoveFun, start=False) -> None:
         """
         新增一个行动
@@ -129,7 +145,7 @@ class moveset:
             self.setstart(id)
 
     def _autoadd(self, fun: AnyFun, mode, *args, use_var=False, varmap=None, kwargs=None,
-                 start_id=None, next_id=None, wrap=True) -> int:
+                 start_id=None, next_id=None, wrap=True, ret=None) -> int:
         """
         自动增加一个move，ID递增，后一个连接前一个
         该函数是总处理函数，具体调用可以看更详细的start,next,end,exith函数
@@ -146,51 +162,56 @@ class moveset:
         :param start_id: 用于mode 0：初始的ID，必须是一个整数
         :param next_id: 用于mode 2：结束时连接到的ID
         :param wrap: 设置为False则需要进一步wrap，设置为True则自动wrap
+        :param ret: 将var中的ret变量设置为该函数返回值
         :return: int类型,该步骤的ID
         """
         if kwargs is None:
             kwargs = {}
         last = self.last_move
         fun = self.str2fun(fun)
+        assert mode == 0 or last is not None, "必须先start！"
         if mode == 0:
             assert type(start_id) is int, "自动组建move，必须以int类型的id开始"
-            self.last_move = (fun, start_id, args, varmap, kwargs, use_var, wrap)
+            self.last_move = (fun, start_id, args, varmap, kwargs, use_var, wrap, ret)
         if mode >= 1:
-            assert last is not None, "必须先start再next！"
-            last_fun, last_id, last_args, last_varmap, last_kwargs, last_use_var, last_wrap = last
+            last_fun, last_id, last_args, last_varmap, last_kwargs, last_use_var, last_wrap, last_ret = last
             assert type(last_id) is int, "自动组建move，上一个id必须是int类型！"
             if last_use_var:
-                wpfun = self.wv(last_fun, last_id + 1, *last_args, **last_kwargs) if last_wrap else last_fun
+                wpfun = self.wv(last_fun, last_id + 1, *last_args, ret=last_ret,
+                                **last_kwargs) if last_wrap else last_fun
                 self.addmove(last_id, wpfun)
             else:
-                wpfun = self.w(last_fun, last_id + 1, *last_args, last_varmap, **last_kwargs) if last_wrap else last_fun
+                wpfun = self.w(last_fun, last_id + 1, *last_args, ret=last_ret, varmap=last_varmap,
+                               **last_kwargs) if last_wrap else last_fun
                 self.addmove(last_id, wpfun)
-            self.last_move = (fun, last_id + 1, args, varmap, kwargs, use_var, wrap)
+            self.last_move = (fun, last_id + 1, args, varmap, kwargs, use_var, wrap, ret)
         if mode == 2:
-            last_fun, last_id, last_args, last_varmap, last_kwargs, last_use_var, last_wrap = self.last_move
-            if last_use_var:
-                wpfun = self.wv(last_fun, next_id, *last_args, **last_kwargs) if last_wrap else last_fun
+            last_id = self.last_move[1]
+            if use_var:
+                wpfun = self.wv(fun, next_id, *args, ret=ret, **kwargs) if wrap else fun
                 self.addmove(last_id, wpfun)
             else:
-                wpfun = self.w(last_fun, next_id, *last_args, last_varmap, **last_kwargs) if last_wrap else last_fun
+                wpfun = self.w(fun, next_id, *args, ret=ret, varmap=varmap,
+                               **kwargs) if wrap else fun
                 self.addmove(last_id, wpfun)
             self.last_move = None
         elif mode == 3:
-            last_fun, last_id, last_args, last_varmap, last_kwargs, last_use_var, last_wrap = self.last_move
-            self.addmove(last_id, last_fun)
+            last_id = self.last_move[1]
+            self.addmove(last_id, fun)
             self.last_move = None
         if self.last_move is None:
             return last_id
         else:
             return self.last_move[1]
 
-    def startw(self, fun: AnyFun, *args, start_id: int = 0, varmap=None, kwargs=None, start=False) -> int:
+    def startw(self, fun: AnyFun, *args, start_id: int = 0, ret=None, varmap=None, kwargs=None, start=False) -> int:
         """
            指定一个编号为start_id的move，此后可以利用next依次连接id递增的move
            不会将变量self.var传入fun中。
            要求start_id必须为整数
            :param fun: 一个待wrap的函数
            :param args: fun函数的参数
+           :param ret: 将var中的ret变量设置为该函数返回值
            :param varmap: var中变量到fun参数的映射
            :param kwargs: fun函数的参数，字典类型
            :param start_id: 初始的ID，必须是一个整数
@@ -199,15 +220,16 @@ class moveset:
            """
         if start:
             self.setstart(start_id)
-        return self._autoadd(fun, 0, *args, use_var=False, varmap=varmap, kwargs=kwargs, start_id=start_id)
+        return self._autoadd(fun, 0, *args, use_var=False, ret=ret, varmap=varmap, kwargs=kwargs, start_id=start_id)
 
-    def startwv(self, fun: AnyFun, *args, start_id: int = 0, kwargs=None, start=False) -> int:
+    def startwv(self, fun: AnyFun, *args, start_id: int = 0, ret=None, kwargs=None, start=False) -> int:
         """
            指定一个编号为start_id的move，此后可以利用next依次连接id递增的move
            要求fun含有参数var以接受变量区self.var
            要求start_id必须为整数
            :param fun: 一个待wrap的函数
            :param args: fun函数的参数
+           :param ret: 将var中的ret变量设置为该函数返回值
            :param kwargs: fun函数的参数，字典类型
            :param start_id: 初始的ID，必须是一个整数
             :param start: 是否作为moveset的入口
@@ -215,93 +237,101 @@ class moveset:
            """
         if start:
             self.setstart(start_id)
-        return self._autoadd(fun, 0, *args, use_var=True, kwargs=kwargs, start_id=start_id)
+        return self._autoadd(fun, 0, *args, use_var=True, ret=ret, kwargs=kwargs, start_id=start_id)
 
-    def startset(self, ms, start_id: int = 0, start=False, static=False, initvar: Optional[Dict] = None) -> int:
+    def startset(self, ms, start_id: int = 0, start=False, ret=None, static=False,
+                 initvar: Optional[Dict] = None) -> int:
         """
         wrap个moveset，并作为start。
         :param ms: moveset类
+        :param ret: 将var中的ret变量设置为该函数返回值
         :param static: 如果设置为True，在子moveset结束后，其变量区不删除
         :param initvar: 补充修改原movesetd的初值
         :param start_id: 初始的ID，必须是一个整数
         :param start: 是否作为moveset的入口
         :return: int类型,该步骤的ID
         """
-        fset = self.wset(ms, 0, static, initvar)
-        return self.startwv(fset, start_id=start_id, start=start)
+        fset = self.wset(ms, 0, ret, static, initvar)
+        return self.startwv(fset, ret=None, start_id=start_id, start=start)
 
-    def nextw(self, fun: AnyFun, *args, varmap=None, kwargs=None) -> int:
+    def nextw(self, fun: AnyFun, *args, ret=None, varmap=None, kwargs=None) -> int:
         """
             wrap一个fun，并将它与上一次start或next的fun连接。
             不会将变量self.var传入fun中。
          :param fun: 一个待wrap的函数
          :param args: fun函数的参数
+         :param ret: 将var中的ret变量设置为该函数返回值
          :param varmap: var中变量到fun参数的映射
          :param kwargs: fun函数的参数，字典类型
          :return: int类型,该步骤的ID
          """
-        return self._autoadd(fun, 1, *args, use_var=False, varmap=varmap, kwargs=kwargs)
+        return self._autoadd(fun, 1, *args, use_var=False, ret=ret, varmap=varmap, kwargs=kwargs)
 
-    def nextwv(self, fun: AnyFun, *args, kwargs=None) -> int:
+    def nextwv(self, fun: AnyFun, *args, ret=None, kwargs=None) -> int:
         """
             wrap一个fun，并将它与上一次start或next的fun连接。
             要求fun含有参数var以接受变量区self.var
          :param fun: 一个待wrap的函数
          :param args: fun函数的参数
+         :param ret: 将var中的ret变量设置为该函数返回值
          :param kwargs: fun函数的参数，字典类型
          :return: int类型,该步骤的ID
          """
-        return self._autoadd(fun, 1, *args, use_var=True, kwargs=kwargs)
+        return self._autoadd(fun, 1, *args, use_var=True, ret=ret, kwargs=kwargs)
 
-    def nextset(self, ms, static=False, initvar: Optional[Dict] = None) -> int:
+    def nextset(self, ms, ret=None, static=False, initvar: Optional[Dict] = None) -> int:
         """
         wrap个moveset，并连接到next。
         :param ms: moveset类
+        :param ret: 将var中的ret变量设置为该函数返回值
         :param static: 如果设置为True，在子moveset结束后，其变量区不删除
         :param initvar: 补充修改原movesetd的初值
         :return: int类型,该步骤的ID
         """
-        fset = self.wset(ms, 0, static, initvar)
-        return self.nextwv(fset)
+        fset = self.wset(ms, 0, ret, static, initvar)
+        return self.nextwv(fset, ret=None)
 
-    def endw(self, fun: AnyFun, *args, next_id: Optional[IDFun] = None, varmap=None, kwargs=None) -> int:
+    def endw(self, fun: AnyFun, *args, next_id: Optional[IDFun] = None, ret=None, varmap=None, kwargs=None) -> int:
         """
          wrap一个fun，并将它与上一次start或next的fun连接。
          结束整个自动创建流程，新fun将指向next_id处
          不会将变量self.var传入fun中。
         :param fun: 一个待wrap的函数
         :param args: fun函数的参数
+        :param ret: 将var中的ret变量设置为该函数返回值
         :param varmap: var中变量到fun参数的映射
         :param kwargs: fun函数的参数，字典类型
         :param next_id: 结束时连接到的ID
         :return: int类型,该步骤的ID
         """
-        return self._autoadd(fun, 2, *args, next_id=next_id, kwargs=kwargs, varmap=varmap, use_var=False)
+        return self._autoadd(fun, 2, *args, next_id=next_id, kwargs=kwargs, ret=ret, varmap=varmap, use_var=False)
 
-    def endwv(self, fun: AnyFun, *args, next_id: Optional[IDFun] = None, kwargs=None) -> int:
+    def endwv(self, fun: AnyFun, *args, next_id: Optional[IDFun] = None, ret=None, kwargs=None) -> int:
         """
           wrap一个fun，并将它与上一次start或next的fun连接。
           结束整个自动创建流程，新fun将指向next_id处
           要求fun含有参数var以接受变量区self.var
          :param fun: 一个待wrap的函数
          :param args: fun函数的参数
+         :param ret: 将var中的ret变量设置为该函数返回值
          :param kwargs: fun函数的参数，字典类型
          :param next_id: 结束时连接到的ID
          :return: int类型,该步骤的ID
          """
-        return self._autoadd(fun, 2, *args, next_id=next_id, kwargs=kwargs, use_var=True)
+        return self._autoadd(fun, 2, *args, next_id=next_id, ret=ret, kwargs=kwargs, use_var=True)
 
-    def endset(self, ms, next_id: Optional[IDType] = None, static=False, initvar: Optional[Dict] = None):
+    def endset(self, ms, next_id: Optional[IDFun] = None, ret=None, static=False, initvar: Optional[Dict] = None):
         """
           wrap个moveset，并连接到end。
           :param ms: moveset类
+          :param ret: 将var中的ret变量设置为该函数返回值
           :param static: 如果设置为True，在子moveset结束后，其变量区不删除
           :param initvar: 补充修改原movesetd的初值
           :param next_id: 结束时连接到的ID
           :return: int类型,该步骤的ID
           """
-        fset = self.wset(ms, 0, static, initvar)
-        return self.endwv(fset, next_id=next_id)
+        fset = self.wset(ms, next_id, ret, static, initvar)
+        return self.endwv(fset, ret=None, next_id=None)
 
     def endif(self, con: ConFun, trueid: IDType, falseid: IDType) -> int:
         """
@@ -314,7 +344,7 @@ class moveset:
         iffun = self.wif(con, trueid, falseid)
         return self._autoadd(iffun, mode=2, use_var=True, wrap=False)
 
-    def exitw(self, fun: AnyFun, *args, return_=None, varmap=None, kwargs=None) -> int:
+    def exitw(self, fun: AnyFun, *args, ret=None, return_=None, varmap=None, kwargs=None) -> int:
         """
          wrap一个fun，并将它与上一次start或next的fun连接。
          结束整个moveset，并且返回return_（如果设置为None，则不会特别设置返回值）
@@ -323,20 +353,24 @@ class moveset:
         :param args: fun函数的参数
         :param varmap: var中变量到fun参数的映射
         :param kwargs: fun函数的参数，字典类型
+        :param ret: 将var中的ret变量设置为该函数返回值，设置为__return__时，若存在return_参数，则__return__看return_
         :param return_: 返回值，设置为None时，不会特别设置返回值
         :return:int类型,该步骤的ID
         """
         if return_ is None:
-            return self._autoadd(fun, 2, *args, next_id="__exit__", varmap=varmap, kwargs=kwargs, use_var=False)
+            return self._autoadd(fun, 2, *args, next_id="__exit__", varmap=varmap, ret=ret, kwargs=kwargs,
+                                 use_var=False)
         else:
             def f(var: Dict) -> IDType:
-                fun(*args, **kwargs)
+                a = fun(*args, **kwargs)
+                if ret is not None:
+                    var[ret] = a
                 var["__return__"] = return_
                 return "__exit__"
 
             return self._autoadd(f, 3)
 
-    def exitwv(self, fun: AnyFun, *args, return_=None, kwargs=None) -> int:
+    def exitwv(self, fun: AnyFun, *args, ret=None, return_=None, kwargs=None) -> int:
         """
          wrap一个fun，并将它与上一次start或next的fun连接。
          结束整个moveset，并且返回return_（如果设置为None，则不会特别设置返回值）
@@ -344,30 +378,34 @@ class moveset:
         :param fun: 一个待wrap的函数
         :param args: fun函数的参数
         :param kwargs: fun函数的参数，字典类型
+        :param ret: 将var中的ret变量设置为该函数返回值，设置为__return__时，若存在return_参数，则__return__看return_
         :param return_: 返回值，设置为None时，不会特别设置返回值
         :return: int类型,该步骤的ID
         """
-        if return_ is None:
-            return self._autoadd(fun, 2, *args, next_id="__exit__", kwargs=kwargs, use_var=True)
+        if return_ is None or ret:
+            return self._autoadd(fun, 2, *args, next_id="__exit__", ret=ret, kwargs=kwargs, use_var=True)
         else:
             def f(var: Dict) -> IDType:
-                fun(*args, **kwargs, var=var)
+                a = fun(var, *args, **kwargs)
+                if ret is not None:
+                    var[ret] = a
                 var["__return__"] = return_
                 return "__exit__"
 
             return self._autoadd(f, 3)
 
-    def exitset(self, ms, return_=None, static=False, initvar: Optional[Dict] = None) -> int:
+    def exitset(self, ms, ret=None, return_=None, static=False, initvar: Optional[Dict] = None) -> int:
         """
           wrap个moveset，并连接到end。
           :param ms: moveset类
           :param static: 如果设置为True，在子moveset结束后，其变量区不删除
           :param initvar: 补充修改原movesetd的初值
+          :param ret: 将var中的ret变量设置为该函数返回值，设置为__return__时，若存在return_参数，则__return__看return_
           :param return_: 返回值，设置为None时，不会特别设置返回值
           :return: int类型,该步骤的ID
           """
-        fset = self.wset(ms, 0, static, initvar)
-        return self.exitwv(fset, return_=return_)
+        fset = self.wset(ms, 0, None, static, initvar)
+        return self.exitwv(fset, ret=ret, return_=return_)
 
     def addvar(self, varname, init=None) -> None:
         """
@@ -388,10 +426,12 @@ class moveset:
         self.var.setdefault("__start__", None)
 
     @staticmethod
-    def w(fun: AnyFun, nextid: Optional[IDFun] = None, *args, varmap: Optional[Dict] = None, **kwargs) -> MoveFun:
+    def w(fun: AnyFun, nextid: Optional[IDFun] = None, *args, ret=None, varmap: Optional[Dict] = None,
+          **kwargs) -> MoveFun:
         """
         wrap一个普通函数为行动函数，并且该函数不会使用到变量var
         :param fun: 需要wrap的函数
+        :param ret: 将var中的ret变量设置为该函数返回值
         :param varmap: 指定某些var中变量到fun参数的映射
         :param nextid: 下一个行动的ID，若设置为None，则以fun的返回值为准；也可以为映射函数
         :param args: fun函数的参数
@@ -406,6 +446,8 @@ class moveset:
             for i, j in varmap.items():
                 kwargs[j] = var[i]
             a = fun(*args, **kwargs)
+            if ret is not None:
+                var[ret] = a
             if callable(nextid):
                 nid = nextid(a)
             else:
@@ -415,10 +457,11 @@ class moveset:
         return f
 
     @staticmethod
-    def wv(fun: AnyFun, nextid: Optional[IDFun] = None, *args, **kwargs) -> MoveFun:
+    def wv(fun: AnyFun, nextid: Optional[IDFun] = None, *args, ret=None, **kwargs) -> MoveFun:
         """
         wrap一个普通函数为行动函数，该函数必须携带var参数来接受变量区
         :param fun: 需要wrap的函数
+        :param ret: 将var中的ret变量设置为该函数返回值
         :param nextid: 下一个行动的ID，若设置为None，则以fun的返回值为准
         :param args: fun函数的参数
         :param kwargs: fun函数的参数
@@ -428,6 +471,8 @@ class moveset:
 
         def f(var: Dict):
             a = fun(*args, **kwargs, var=var)
+            if ret is not None:
+                var[ret] = a
             if callable(nextid):
                 nid = nextid(a)
             else:
@@ -455,11 +500,14 @@ class moveset:
 
         return f
 
-    def wset(self, ms, nextid: Optional[IDFun] = None, static=False, initvar: Optional[Dict] = None) -> MoveFun:
+    @staticmethod
+    def wset(ms, nextid: Optional[IDFun] = None, ret=None, static=False,
+             initvar: Optional[Dict] = None) -> MoveFun:
         """
         wrap个moveset
         :param ms: moveset类
         :param nextid: 下一个行动的ID，若设置为None，则以ms的的返回值为准
+        :param ret: 将var中的ret变量设置为该函数返回值
         :param static: 如果设置为True，在子moveset结束后，其变量区不删除
         :param initvar: 补充修改原movesetd的初值
         """
@@ -472,7 +520,9 @@ class moveset:
             var.setdefault(sub_name, {})
             var[sub_name].update(initvar)
             try:
-                a = ms.run(var=var[sub_name], continue_=True, parent=self)
+                a = ms.run(var=var[sub_name], continue_=True, parent=var["__self__"])
+                if ret is not None:
+                    var[ret] = a
             finally:
                 if not static:
                     del var[sub_name]
@@ -523,10 +573,14 @@ class moveset:
         p = self
         if p.parent is not None:
             del p.var["__parent__"]
+            del p.var["__self__"]
             p.parent.savestate()
             p.var["__parent__"] = p.parent.var
+            p.var["__self__"] = p
         else:
+            del p.var["__self__"]
             p._savestate()
+            p.var["__self__"] = p
 
     def loadstate(self):
         """
@@ -558,17 +612,19 @@ class moveset:
             if self.parent is None:
                 self.loadstate()
             cur = self.var["__current__"]
+
         if cur is None:
             cur = start if start is not None else self.var["__start__"]
         if self.parent is not None:
             self.var["__parent__"] = self.parent.var
+        self.var["__self__"] = self
         while cur in self.moves or cur == "__last__":
-            if cur=="__last__":
+            if cur == "__last__":
                 # 跳转到上一次保存的位置
                 if "__stack__" in self.var:
                     cur = self.var["__stack__"][-1]
                     del self.var["__stack__"][-1]
-                    if len(self.var["__stack__"])==0:
+                    if len(self.var["__stack__"]) == 0:
                         del self.var["__stack__"]
                 else:
                     cur = "__exit__"
@@ -581,18 +637,19 @@ class moveset:
             except moveerr as me:
                 if me.code in self.catch:
                     # 暂存当前cur并跳转
-                    nextid,savecur=self.catch[me.code]
+                    nextid, savecur = self.catch[me.code]
                     if savecur:
-                        self.var.setdefault("__stack__",[])
-                        self.var["__stack__"]+=[cur]
+                        self.var.setdefault("__stack__", [])
+                        self.var["__stack__"] += [cur]
                     cur = nextid
                 else:
                     raise me
             except Exception as e:
                 if "__parent__" in self.var:
                     del self.var["__parent__"]
+                del self.var["__self__"]
                 if type(e) is not moveerr and self.errcode is not None:
-                    raise moveerr(self.errcode,desc=self.name)
+                    raise moveerr(self.errcode, desc=self.name)
                 else:
                     raise e
 
@@ -602,4 +659,5 @@ class moveset:
             print("Unknown Moveset:", cur)
         if "__parent__" in self.var:
             del self.var["__parent__"]
+        del self.var["__self__"]
         return self.var["__return__"]
