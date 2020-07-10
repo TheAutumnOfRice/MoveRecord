@@ -2,7 +2,7 @@ import json
 import os
 import pickle
 from copy import deepcopy
-from typing import Callable, Any, Optional, Dict, Union, Tuple
+from typing import Callable, Any, Optional, Dict, Union, Tuple, List
 
 MoveFun = Callable[[Dict], Any]
 AnyFun = Union[Callable[..., Any], str, None]
@@ -39,6 +39,7 @@ class moveset:
         __return__ moveset执行完毕后的返回值
         __current__ 当前执行（还没有执行完）的步骤
         __start__ moveset的入口ID
+        __onstart__ 可选参数，moveset执行时不管current首先跳转的ID
         __parent__ 上层moveset，该变量建议不修改，且会在save和load时主动跳过
         __self__ 自己moveset实例，请勿使用
         __stack__ 用于捕获异常后，记录上一次current。该变量建议不修改。
@@ -115,6 +116,9 @@ class moveset:
     def setstart(self, id: IDType):
         self.varinit["__start__"] = id
 
+    def setstatic(self, id: IDType):
+        self.varinit["__start__"] = id
+
     def seterr(self, code) -> None:
         """
         如果该moveset运行时报错，且错误类型不为moveerr
@@ -143,6 +147,12 @@ class moveset:
         self.moves[id] = fun
         if start:
             self.setstart(id)
+
+    def onstart(self, id: IDType):
+        """
+        设置当发生start事件（脚本运行）时，跳转的代码
+        """
+        self.varinit["__onstart__"] = id
 
     def _autoadd(self, fun: AnyFun, mode, *args, use_var=False, varmap=None, kwargs=None,
                  start_id=None, next_id=None, wrap=True, ret=None) -> int:
@@ -534,6 +544,70 @@ class moveset:
 
         return f
 
+    @staticmethod
+    def addstack(var: Dict, stack_id: IDType):
+        var.setdefault("__stack__", [])
+        var["__stack__"] += [stack_id]
+
+    @staticmethod
+    def delstack(var: Dict):
+        if "__stack__" in var:
+            s = var["__stack__"]
+            del s[-1]
+            if len(s) == 0:
+                del var["__stack__"]
+            return 1
+        else:
+            return 0
+
+    def T_mapstart(self,
+                   id_map: Union[Dict[Union[IDType, List[IDType]], IDType], Callable[[IDType], Union[IDType, None]]],
+                   start_id=999999):
+        """
+        模板：进入moveset时，如果上一步current在某些特殊位置时，跳转到特定ID。
+        要求：该模板会重写onstart！
+        :param id_map:
+            若id_map为一个IDType->IDType的函数，则直接执行current->id_map(current)的映射
+                若映射结果为None，则执行__last__。请不要自己跳转__last__。
+            若id_map为一个IDType:IDType的字典，则检测到指定左值，跳转到对应右值，其余__last__。
+                该字典的左值也可以为列表[]，表示多点映射
+                或者一个返回布尔类型的函数，则该函数返回值为True时跳转到右值
+                或者一个二元Tuple[a,b],则a<=current<=b的全部ID跳转到右值。
+        :param start_id:
+            mapstart跳转逻辑存放的ID
+        """
+        self.onstart(start_id)
+
+        def f(var):
+            def do(next_cur):
+                if next_cur is None:
+                    return "__last__"
+                else:
+                    moveset.delstack(var)
+                    return next_cur
+
+            last_cur = var["__stack__"][-1]
+            if callable(id_map):
+                next_cur = id_map(last_cur)
+                return do(next_cur)
+            else:
+                for con, next_cur in id_map.items():
+                    if callable(con):
+                        if con(last_cur):
+                            return do(next_cur)
+                    elif type(con) is list:
+                        if last_cur in con:
+                            return do(next_cur)
+                    elif type(con) is tuple:
+                        if con[0] <= last_cur <= con[1]:
+                            return do(next_cur)
+                    else:
+                        if last_cur == con:
+                            return do(next_cur)
+            return "__last__"
+
+        self.addmove(start_id, self.wv(f))
+
     def _savestate(self):
         if not os.path.isdir(self.addr):
             os.makedirs(self.addr)
@@ -618,6 +692,11 @@ class moveset:
         if self.parent is not None:
             self.var["__parent__"] = self.parent.var
         self.var["__self__"] = self
+
+        # OnStart 检测
+        if "__onstart__" in self.var and self.var["__onstart__"] is not None:
+            self.addstack(self.var, cur)
+            cur = self.var["__onstart__"]
         while cur in self.moves or cur == "__last__":
             if cur == "__last__":
                 # 跳转到上一次保存的位置
@@ -628,8 +707,7 @@ class moveset:
                         del self.var["__stack__"]
                 else:
                     cur = "__exit__"
-                    print("Current Stack Empty!")
-                    break
+                    raise Exception("Current Stack Empty!")
             self.var["__current__"] = cur
             self.savestate()
             try:
@@ -656,7 +734,7 @@ class moveset:
         self.var["__current__"] = None
         self.savestate()
         if cur != "__exit__":
-            print("Unknown Moveset:", cur)
+            raise Exception("Unknown Moveset:", cur)
         if "__parent__" in self.var:
             del self.var["__parent__"]
         del self.var["__self__"]
