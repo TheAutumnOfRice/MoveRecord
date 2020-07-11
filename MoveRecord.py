@@ -62,6 +62,7 @@ class moveset:
         self.name = name
         self.use_json = use_json  # 警告：json类型只能支持数字和字符串变量！
         self.last_move = None  # 自动创建序列时记录上一次的创建参数
+        self.tmp = {}  # 临时存放空间
 
     @staticmethod
     def str2fun(fun):
@@ -210,8 +211,10 @@ class moveset:
             self.addmove(last_id, fun)
             self.last_move = None
         if self.last_move is None:
+            self.tmp["autoid"] = last_id
             return last_id
         else:
+            self.tmp["autoid"] = self.last_move[1]
             return self.last_move[1]
 
     def startw(self, fun: AnyFun, *args, start_id: int = 0, ret=None, varmap=None, kwargs=None, start=False) -> int:
@@ -550,19 +553,20 @@ class moveset:
         var["__stack__"] += [stack_id]
 
     @staticmethod
-    def delstack(var: Dict):
+    def popstack(var: Dict):
         if "__stack__" in var:
             s = var["__stack__"]
+            p = s[-1]
             del s[-1]
             if len(s) == 0:
                 del var["__stack__"]
-            return 1
+            return p
         else:
-            return 0
+            raise Exception("Stack Empty!")
 
     def T_mapstart(self,
                    id_map: Union[Dict[Union[IDType, List[IDType]], IDType], Callable[[IDType], Union[IDType, None]]],
-                   start_id=999999):
+                   self_id=999999, popstack=True):
         """
         模板：进入moveset时，如果上一步current在某些特殊位置时，跳转到特定ID。
         要求：该模板会重写onstart！
@@ -573,17 +577,22 @@ class moveset:
                 该字典的左值也可以为列表[]，表示多点映射
                 或者一个返回布尔类型的函数，则该函数返回值为True时跳转到右值
                 或者一个二元Tuple[a,b],则a<=current<=b的全部ID跳转到右值。
-        :param start_id:
+        :param self_id:
             mapstart跳转逻辑存放的ID
+        :param popstack:
+            是否自动删除多余的cur
+            若选择手动删除，则需要在程序中自行跳转__last__或者用moveset.popstack(var)手动删除
+            若选择自动删除，请不要将id映射到__last__上，而应该为None。
         """
-        self.onstart(start_id)
+        self.onstart(self_id)
 
         def f(var):
             def do(next_cur):
                 if next_cur is None:
                     return "__last__"
                 else:
-                    moveset.delstack(var)
+                    if popstack:
+                        moveset.popstack(var)
                     return next_cur
 
             last_cur = var["__stack__"][-1]
@@ -606,7 +615,145 @@ class moveset:
                             return do(next_cur)
             return "__last__"
 
-        self.addmove(start_id, self.wv(f))
+        self.addmove(self_id, self.wv(f))
+
+    def T_forcestart(self, start_id: IDType, self_id: IDType = 999999):
+        """
+        模板：强制从某ID开始
+        不沦上次运行到哪里，重新进入moveset后强制跳转到start_id
+        与onstart，start冲突。
+        :param start_id: 强制跳转位置
+        :param self_id: 自身逻辑位置
+        """
+        self.T_mapstart(lambda x: start_id, self_id)
+
+    def T_nextflag(self, flagkey, flagvalue=1):
+        """
+        模板：基于nextwv，设置某flag的值为某数
+        :param flagkey: flag名称
+        :param flagvalue: flag新值
+        :return: 该步骤的ID
+        """
+
+        def f(var):
+            var[flagkey] = flagvalue
+
+        self.tmp.setdefault("flags", set())
+        self.tmp["flags"].add(flagkey)
+        return self.nextwv(f)
+
+    def T_clearflags(self):
+        """
+        模板：清除所有flag
+        :return: 该步骤的ID
+        """
+        flags = self.tmp["flags"]
+        del self.tmp["flags"]
+
+        def f(var):
+            for i in flags:
+                if i in var:
+                    del var[i]
+
+        return self.nextwv(f)
+
+    def _T_if(self, cmd) -> IDType:
+        self_id = self.tmp["autoid"] + 1
+        self.endw(None, next_id=self_id)
+        self.tmp.setdefault("ifflag", [])  # if栈
+        ifpack = {"self": self_id, "true": self_id + 1, "cmd": cmd}
+        self.tmp["ifflag"] += [ifpack]
+        return self.startw(None, start_id=self_id + 1)
+
+    def T_ifflag(self, flagkey, flagvalue=1, mode="==") -> IDType:
+        """
+        模板：只有当flag满足条件时才执行后续语句块内容
+        last->IFFLAG{
+            END-><IF>
+                True-> ** start **
+                False-> ...
+            -> ...
+        }
+        其中** start ** 为该模板最后一步，所以使用T_ifflag后，需要使用next,end或exit继续。
+        :param flagkey: flag名称
+        :param flagvalue: flag比较值
+        :param mode: 比较模式(==,<=,>=,!=,<,>...)
+        :return: start的ID
+        """
+        cmd = "'%s' in var and var['%s']%s%s" % (str(flagkey), str(flagkey), mode, str(flagvalue))
+        return self._T_if(cmd)
+
+    def T_ifnotflag(self, flagkey, flagvalue=1, mode="=="):
+        cmd = "'%s' not in var or not var['%s']%s%s" % (str(flagkey), str(flagkey), mode, str(flagvalue))
+        return self._T_if(cmd)
+
+    def T_elseflag(self) -> IDType:
+        """
+        模板：与T_ifflag成对使用
+        last->IFFLAG{
+            END-><IF>
+                True-> ...
+                False-> ** start **
+            -> ...
+        }
+
+        其中** start ** 为该模板最后一步，所以使用T_ifflag后，需要使用next,end或exit继续。
+        :return: ；start的ID
+        """
+        # 取出之前的IF包
+        lastpack = self.tmp["ifflag"][-1]
+        # 检查配对性
+        assert "self" in lastpack and "true" in lastpack and "cmd" in lastpack, "else需要和if配对"
+        # 结束前面的IF，准备跳转
+        endif_id = self.tmp["autoid"] + 1
+        self.endw(None, next_id=endif_id + 1)
+        else_id = endif_id + 1
+        # 构造新的IF包
+        self.tmp["ifflag"][-1] = {"endif_id": endif_id}
+        # 补全之前的IF
+        self_id = lastpack["self"]
+        true_id = lastpack["true"]
+        cmd = lastpack["cmd"]
+        self.addmove(self_id, self.wif(cmd, true_id, else_id))
+        # start
+        return self.startw(None, start_id=else_id)
+
+    def T_endflag(self):
+        """
+        模板：与T_ifflag成对使用
+        last->IFFLAG{
+            END-><IF>
+                True-> ...
+                False-> ...
+            -> ** start **
+        }
+        其中** start ** 为该模板最后一步，所以使用T_ifflag后，需要使用next,end或exit继续。
+        :return: start的ID
+        """
+        # 取出之前的IF包
+        lastpack = self.tmp["ifflag"][-1]
+        del self.tmp["ifflag"][-1]
+        # 结束之前的部分
+        if self.last_move is not None:
+            end_id = self.nextw(None)
+        else:
+            end_id = self.tmp["autoid"] + 1
+            self.startw(None, start_id=end_id)
+        # 如果是IF包：
+        if "self" in lastpack and "true" in lastpack and "cmd" in lastpack:
+            # 补全IF
+            self_id = lastpack["self"]
+            true_id = lastpack["true"]
+            cmd = lastpack["cmd"]
+            self.addmove(self_id, self.wif(cmd, true_id, end_id))
+        # 如果是else包：
+        elif "endif_id" in lastpack:
+            # 补全Else
+            endif_id = lastpack["endif_id"]
+            self.addmove(endif_id, self.w(None, nextid=end_id))
+        else:
+            raise Exception("Cannot find IF flag or ELSE flag!")
+        return end_id
 
     def _savestate(self):
         if not os.path.isdir(self.addr):
