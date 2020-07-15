@@ -2,7 +2,8 @@ from MoveRecord import moveset
 
 """
 Example 11：
-2020-07-11更新： ifflag elseflag endflag的使用
+2020-07-11更新： ifflag else end的使用
+2020-07-15更新： if （对非临时变量的判断）
 处理逻辑：
 A->B->
     <IF> mode=1
@@ -62,16 +63,16 @@ if __name__ == "__main__":
     ms.startw(FunA, start=True)
     ms.nextw(FunB)
     RD = ms.nextwv("var['mode']=int(input('请输入mode'))")
-    ms.T_ifflag("mode", 1)
+    ms.T_if("mode", 1)
     ms.nextw(FunC)
     ms.nextw(FunD)
-    ms.T_elseflag()
-    ms.T_ifflag("mode", 2)
+    ms.T_else()
+    ms.T_if("mode", 2)
     ms.nextw(FunE)
     ms.nextw(FunF)
-    ms.T_elseflag()
+    ms.T_else()
     ms.endw("print('输入错误，请重新输入')", next_id=RD)
-    ms.T_endflag()
-    ms.T_endflag()
+    ms.T_end()
+    ms.T_end()
     ms.exitw(FunG)
     ms.run("rec")
